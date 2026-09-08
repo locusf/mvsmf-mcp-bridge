@@ -79,8 +79,8 @@ stderr.
 
 ### GitHub Copilot CLI
 
-Add to `.copilot/mcp-config.json` (project) or `~/.copilot/mcp-config.json`
-(user):
+Add to `.mcp.json` (or `.github/mcp.json`) at your project root, or to
+`~/.copilot/mcp-config.json` for all projects:
 
 ```json
 {
