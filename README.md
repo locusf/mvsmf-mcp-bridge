@@ -26,18 +26,34 @@ using HTTP Basic Auth:
 | `readDataset` | `GET /zosmf/restfiles/ds/{name}` |
 | `listMembers` | `GET /zosmf/restfiles/ds/{name}/member` |
 | `readMember` | `GET /zosmf/restfiles/ds/{name}({member})` |
+| `writeDataset` | `PUT /zosmf/restfiles/ds/{name}` |
+| `writeMember` | `PUT /zosmf/restfiles/ds/{name}({member})` |
+| `listUssFiles` | `GET /zosmf/restfiles/fs?path=...` |
+| `readUssFile` | `GET /zosmf/restfiles/fs/{filepath}` |
+| `writeUssFile` | `PUT /zosmf/restfiles/fs/{filepath}` |
+| `createUssFile` | `POST /zosmf/restfiles/fs/{filepath}` |
+| `deleteUssFile` | `DELETE /zosmf/restfiles/fs/{filepath}` |
 | `listJobs` | `GET /zosmf/restjobs/jobs` |
 | `getJobStatus` | `GET /zosmf/restjobs/jobs/{jobname}/{jobid}` |
 | `listJobFiles` | `GET /zosmf/restjobs/jobs/{jobname}/{jobid}/files` |
 | `readJobFile` | `GET /zosmf/restjobs/jobs/{jobname}/{jobid}/files/{ddid}/records` |
 | `submitJob` | `PUT /zosmf/restjobs/jobs` (inline JCL) |
+| `purgeJob` | `DELETE /zosmf/restjobs/jobs/{jobname}/{jobid}` |
+| `issueConsoleCommand` | `PUT /zosmf/restconsoles/consoles/{consoleName}` |
+| `getConsoleMessages` | `GET /zosmf/restconsoles/consoles/{consoleName}/solmsgs/{key}` |
+| `getConsoleDetections` | `GET /zosmf/restconsoles/consoles/{consoleName}/detections/{key}` |
+| `getHardcopyLog` | `GET /zosmf/restconsoles/v1/log` |
 
 See mvsMF's own
 [endpoint reference](https://github.com/mvslovers/mvsmf/blob/main/docs/endpoints/README.md)
 for the full semantics of each call.
 
-> **Caution:** `submitJob` executes real batch work on the target MVS system.
-> Treat it with the same care as any tool that can run arbitrary code.
+> **Caution:** `submitJob`, `purgeJob`, `writeDataset`, `writeMember`,
+> `writeUssFile`, `createUssFile`, `deleteUssFile`, and `issueConsoleCommand`
+> all cause real, sometimes irreversible effects on the target MVS system —
+> running batch work, cancelling jobs, overwriting or deleting data, and
+> issuing operator commands that can affect the whole shared guest. Treat
+> them with the same care as any tool that can run arbitrary code.
 
 ## Requirements
 
