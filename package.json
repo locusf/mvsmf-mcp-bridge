@@ -1,6 +1,6 @@
 {
   "name": "mvsmf-mcp-bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "Minimal MCP server bridging to a running mvsMF (z/OSMF-compatible REST API) instance on MVS 3.8j/Hercules",
