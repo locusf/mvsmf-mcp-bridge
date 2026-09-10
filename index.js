@@ -1,14 +1,21 @@
 #!/usr/bin/env node
-// Minimal MCP server that bridges to a running mvsMF (z/OSMF-compatible REST
-// API) instance on this repository's MVS 3.8j / Hercules guest. Speaks MCP
-// over stdio; each tool call is translated into one mvsMF REST call using
-// Basic Auth. See docs/endpoints/ in https://github.com/mvslovers/mvsmf for
-// the upstream API reference this bridge implements against.
+// MCP server for the z/OSMF REST API. Speaks MCP over stdio; each tool call is
+// translated into one z/OSMF REST call using Basic Auth.
 //
-// Config (env vars):
-//   MVSMF_BASE_URL   e.g. http://127.0.0.1:8090        (required)
-//   MVSMF_USER       TSO userid                        (required)
-//   MVSMF_PASSWORD   TSO password                       (required)
+// Two backends are supported, selected with ZOSMF_MODE:
+//   zosmf  (default) a real IBM z/OSMF instance; the full tool set is exposed.
+//   mvsmf            mvsMF (https://github.com/mvslovers/mvsmf), the z/OSMF-
+//                    compatible API for MVS 3.8j. Tools and options mvsMF does
+//                    not implement are removed from tools/list and refused if
+//                    called anyway.
+//
+// Config (env vars; the MVSMF_* names from earlier releases are still read):
+//   ZOSMF_BASE_URL       e.g. https://zosmf.example.com:443 or http://127.0.0.1:8090
+//   ZOSMF_USER           userid
+//   ZOSMF_PASSWORD       password
+//   ZOSMF_MODE           zosmf | mvsmf   (defaults to mvsmf when only MVSMF_* vars are set)
+//   ZOSMF_INSECURE_TLS   true  -> accept self-signed z/OSMF certificates
+//                        (for a CA bundle use NODE_EXTRA_CA_CERTS instead)
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -17,9 +24,21 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
-const BASE_URL = process.env.MVSMF_BASE_URL || 'http://127.0.0.1:8090';
-const USER = process.env.MVSMF_USER;
-const PASSWORD = process.env.MVSMF_PASSWORD;
+const env = process.env;
+const legacyEnv = Boolean(env.MVSMF_BASE_URL || env.MVSMF_USER || env.MVSMF_PASSWORD);
+const BASE_URL = (env.ZOSMF_BASE_URL || env.MVSMF_BASE_URL || 'http://127.0.0.1:8090').replace(/\/+$/, '');
+const USER = env.ZOSMF_USER || env.MVSMF_USER;
+const PASSWORD = env.ZOSMF_PASSWORD || env.MVSMF_PASSWORD;
+const MODE = (env.ZOSMF_MODE || (legacyEnv && !env.ZOSMF_BASE_URL ? 'mvsmf' : 'zosmf')).toLowerCase();
+if (MODE !== 'zosmf' && MODE !== 'mvsmf') {
+  console.error(`ZOSMF_MODE must be "zosmf" or "mvsmf" (got "${env.ZOSMF_MODE}")`);
+  process.exit(2);
+}
+const MVSMF = MODE === 'mvsmf';
+if (/^(1|true|yes)$/i.test(env.ZOSMF_INSECURE_TLS || '')) {
+  // Node's fetch reads this at connect time; the process talks to one host only.
+  env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+}
 
 // ---------------------------------------------------------------------------
 // HTTP plumbing
@@ -31,9 +50,9 @@ function authHeader() {
   return { Authorization: `Basic ${b64}` };
 }
 
-// Response headers minus the session cookie: mvsMF answers every Basic request
-// with a Set-Cookie: LtpaToken2=... and there is no reason to echo a bearer
-// credential into the model transcript.
+// Response headers minus the session cookie: z/OSMF and mvsMF answer every
+// Basic request with a Set-Cookie: LtpaToken2=... and there is no reason to
+// echo a bearer credential into the model transcript.
 function responseHeaders(res) {
   const h = Object.fromEntries(res.headers);
   delete h['set-cookie'];
@@ -43,11 +62,12 @@ function responseHeaders(res) {
 // binary: true  -> body returned as base64 in `bodyBase64` (plus `byteLength`);
 //                  falls back to text/JSON parsing on non-2xx so error bodies
 //                  stay readable.
-async function mvsmfFetch(path, { method = 'GET', headers = {}, body, binary = false } = {}) {
+async function zosmfFetch(path, { method = 'GET', headers = {}, body, binary = false } = {}) {
   const url = `${BASE_URL}${path}`;
   const res = await fetch(url, {
     method,
-    headers: { ...authHeader(), ...headers },
+    // z/OSMF rejects any request without X-CSRF-ZOSMF-HEADER; mvsMF ignores it.
+    headers: { 'X-CSRF-ZOSMF-HEADER': 'zosmf-mcp', ...authHeader(), ...headers },
     body,
   });
   const out = { status: res.status, ok: res.ok, headers: responseHeaders(res) };
@@ -76,12 +96,18 @@ function ussPath(path) {
   return path.split('/').filter(Boolean).map(enc).join('/');
 }
 
-function dsPath(dsname, member) {
-  return `/zosmf/restfiles/ds/${enc(dsname)}${member ? `(${enc(member)})` : ''}`;
+// volser selects the -(volser) uncataloged form; z/OSMF only (mvsMF answers 404).
+function dsPath(dsname, member, volser) {
+  const vol = volser ? `-(${enc(volser)})/` : '';
+  return `/zosmf/restfiles/ds/${vol}${enc(dsname)}${member ? `(${enc(member)})` : ''}`;
 }
 
 function jobPath(jobname, jobid) {
   return `/zosmf/restjobs/jobs/${enc(jobname)}/${enc(jobid)}`;
+}
+
+function jsonBody(method, obj, extraHeaders = {}) {
+  return { method, headers: { 'Content-Type': 'application/json', ...extraHeaders }, body: JSON.stringify(obj) };
 }
 
 function consolePath(consoleName) {
@@ -127,11 +153,13 @@ const EBCDIC_QMARK = 0x6f; // substitute for characters outside Latin-1
 // Look the data set up in the catalog listing to learn RECFM/LRECL.
 async function datasetAttrs(dsname) {
   const want = dsname.toUpperCase();
-  const r = await mvsmfFetch(`/zosmf/restfiles/ds?${new URLSearchParams({ dslevel: want })}`);
+  // z/OSMF lists names only unless asked for base attributes; mvsMF always sends them.
+  const headers = MVSMF ? {} : { 'X-IBM-Attributes': 'base' };
+  const r = await zosmfFetch(`/zosmf/restfiles/ds?${new URLSearchParams({ dslevel: want })}`, { headers });
   const item = r.ok && Array.isArray(r.body?.items) ? r.body.items.find((i) => i.dsname === want) : undefined;
   if (!item) throw new Error(`Cannot read attributes of ${want} from the catalog (list status ${r.status})`);
-  // mvsMF emits lrecl/blksize as strings; normalize so arithmetic stays numeric.
-  return { ...item, lrecl: Number(item.lrecl) || 0, blksize: Number(item.blksize) || 0 };
+  // Both servers emit lrecl/blksize as strings (z/OSMF names the latter blksz).
+  return { ...item, lrecl: Number(item.lrecl) || 0, blksize: Number(item.blksize ?? item.blksz) || 0 };
 }
 
 function requireFixed(recfm, lrecl, what) {
@@ -182,40 +210,55 @@ function decodeRecords(buf, cp, lrecl) {
 // Shared option handling for data set / USS reads and writes
 // ---------------------------------------------------------------------------
 
+// X-IBM-Data-Type value for a transfer, or undefined for the server default.
+// fileEncoding (z/OSMF only) rides on text mode: "text;fileEncoding=IBM-1047".
+function dataTypeHeader(dataType, fileEncoding) {
+  const dt = dataType || 'text';
+  if (fileEncoding) {
+    if (dt !== 'text') throw new Error('fileEncoding applies to text transfers only; do not combine it with dataType binary/record.');
+    return `text;fileEncoding=${fileEncoding}`;
+  }
+  return dt === 'text' ? undefined : dt;
+}
+
 function readHeaders(args) {
   const h = {};
-  if (args.dataType && args.dataType !== 'text') h['X-IBM-Data-Type'] = args.dataType;
+  const dt = dataTypeHeader(args.dataType, args.fileEncoding);
+  if (dt) h['X-IBM-Data-Type'] = dt;
+  if (args.recordRange) h['X-IBM-Record-Range'] = args.recordRange;
+  if (args.migratedRecall) h['X-IBM-Migrated-Recall'] = args.migratedRecall;
   if (args.returnEtag) h['X-IBM-Return-Etag'] = 'true';
   if (args.ifNoneMatch) h['If-None-Match'] = args.ifNoneMatch;
   return h;
 }
 
 function writeHeaders(args, dataType) {
-  const h = { 'Content-Type': dataType === 'binary' ? 'application/octet-stream' : 'text/plain' };
-  if (dataType === 'binary') h['X-IBM-Data-Type'] = 'binary';
+  const h = { 'Content-Type': dataType === 'text' ? 'text/plain' : 'application/octet-stream' };
+  const dt = dataTypeHeader(dataType, args.fileEncoding);
+  if (dt) h['X-IBM-Data-Type'] = dt;
+  if (args.migratedRecall) h['X-IBM-Migrated-Recall'] = args.migratedRecall;
   if (args.returnEtag) h['X-IBM-Return-Etag'] = 'true';
   if (args.ifMatch) h['If-Match'] = args.ifMatch;
   return h;
 }
 
 // Resolve the body for a write from content / contentBase64 / encoding.
-// Returns { body, dataType } where dataType is 'text' or 'binary'.
+// Returns { body, dataType } where dataType is 'text', 'binary' or 'record'.
 async function writeBody(args, dsname) {
-  if (args.dataType === 'record') {
-    throw new Error('dataType "record" is not implemented for writes by mvsMF; use "binary" for a byte-exact round trip.');
-  }
   if (args.encoding) {
     if (args.content === undefined) throw new Error('encoding requires `content` (text).');
     if (args.contentBase64 !== undefined) throw new Error('encoding and contentBase64 are mutually exclusive.');
+    if (args.fileEncoding) throw new Error('encoding (local translation) and fileEncoding (server translation) are mutually exclusive.');
     const { recfm, lrecl } = await datasetAttrs(dsname);
     requireFixed(recfm, lrecl, `encoding=${args.encoding}`);
     return { body: encodeRecords(args.content, args.encoding, lrecl), dataType: 'binary' };
   }
   if (args.contentBase64 !== undefined) {
     if (args.content !== undefined) throw new Error('content and contentBase64 are mutually exclusive.');
-    return { body: Buffer.from(args.contentBase64, 'base64'), dataType: 'binary' };
+    return { body: Buffer.from(args.contentBase64, 'base64'), dataType: args.dataType === 'record' ? 'record' : 'binary' };
   }
   if (args.content !== undefined) {
+    if (args.dataType === 'record') throw new Error('dataType "record" needs length-prefixed bytes; pass them as contentBase64.');
     if (args.dataType === 'binary') return { body: Buffer.from(args.content, 'utf8'), dataType: 'binary' };
     return { body: args.content, dataType: 'text' };
   }
@@ -227,7 +270,8 @@ async function readDatasetLike(path, dsname, args) {
     if (args.dataType && args.dataType !== 'binary') {
       throw new Error('encoding implies binary transfer; do not combine it with dataType "text" or "record".');
     }
-    const r = await mvsmfFetch(path, { headers: readHeaders({ ...args, dataType: 'binary' }), binary: true });
+    if (args.fileEncoding) throw new Error('encoding (local translation) and fileEncoding (server translation) are mutually exclusive.');
+    const r = await zosmfFetch(path, { headers: readHeaders({ ...args, dataType: 'binary' }), binary: true });
     if (!r.ok || r.bodyBase64 === undefined) return textResult(r);
     const { recfm, lrecl } = await datasetAttrs(dsname);
     requireFixed(recfm, lrecl, `encoding=${args.encoding}`);
@@ -236,17 +280,37 @@ async function readDatasetLike(path, dsname, args) {
     return textResult({ ...rest, encoding: args.encoding, lrecl, recfm, byteLength, body: decodeRecords(buf, args.encoding, lrecl) });
   }
   const binary = args.dataType === 'binary' || args.dataType === 'record';
-  return textResult(await mvsmfFetch(path, { headers: readHeaders(args), binary }));
+  return textResult(await zosmfFetch(path, { headers: readHeaders(args), binary }));
 }
 
 async function writeDatasetLike(path, dsname, args) {
   const { body, dataType } = await writeBody(args, dsname);
-  return textResult(await mvsmfFetch(path, { method: 'PUT', headers: writeHeaders(args, dataType), body }));
+  return textResult(await zosmfFetch(path, { method: 'PUT', headers: writeHeaders(args, dataType), body }));
 }
 
 // ---------------------------------------------------------------------------
 // Tool schemas
+//
+// Every tool and option below is defined for z/OSMF. Ones mvsMF does not
+// implement are tagged with zo() / ZOSMF_ONLY and dropped from the schema
+// in mvsmf mode; callArgs() then refuses them if a client sends them anyway.
 // ---------------------------------------------------------------------------
+
+const ZOSMF_ONLY = Symbol('zosmfOnly');
+const zo = (prop) => ({ ...prop, [ZOSMF_ONLY]: true });
+
+const DS_VOLSER = zo({ type: 'string', description: 'Volume serial for an uncataloged data set (the -(volser) route).' });
+
+const FILE_ENCODING = zo({
+  type: 'string',
+  description: 'Server-side code page for text mode (X-IBM-Data-Type: text;fileEncoding=…), e.g. "IBM-1047", "IBM-037". Mutually exclusive with dataType binary/record and with encoding.',
+});
+
+const MIGRATED_RECALL = zo({
+  type: 'string',
+  enum: ['wait', 'nowait', 'error'],
+  description: 'What to do if the data set is migrated (X-IBM-Migrated-Recall). Default wait.',
+});
 
 const DS_READ_OPTS = {
   dataType: {
@@ -255,36 +319,44 @@ const DS_READ_OPTS = {
     description:
       'Transfer mode (X-IBM-Data-Type). text (default): server EBCDIC->ASCII conversion, body returned as text. binary: raw bytes, returned as bodyBase64. record: like binary with a 4-byte big-endian length before each record, returned as bodyBase64.',
   },
+  fileEncoding: FILE_ENCODING,
   encoding: {
     type: 'string',
     enum: ['cp037', 'cp1047'],
     description:
-      'Fetch in binary and translate locally with this EBCDIC code page instead of the server\'s text conversion (RECFM F/FB only). Use cp1047 to read source whose [ ] ^ were stored at the IBM-1047 code points (e.g. JCC C source), which the text mode cannot represent. Mutually exclusive with dataType.',
+      "Fetch in binary and translate locally with this EBCDIC code page instead of the server's text conversion (RECFM F/FB only). Needed on mvsMF, whose text mode has one fixed table that puts [ ] ^ at the IBM-037 positions; on z/OSMF prefer fileEncoding. Mutually exclusive with dataType and fileEncoding.",
   },
+  recordRange: zo({ type: 'string', description: 'Subset of records to read (X-IBM-Record-Range): "start-end" (0-based, inclusive) or "start,count".' }),
+  migratedRecall: MIGRATED_RECALL,
   returnEtag: { type: 'boolean', description: 'Ask for an ETag (X-IBM-Return-Etag) to use as ifMatch on a later write.' },
   ifNoneMatch: { type: 'string', description: 'Conditional read: an ETag from an earlier read. Answers 304 with no body if unchanged.' },
 };
 
 const DS_WRITE_OPTS = {
   content: { type: 'string', description: 'Text content to write. Records are split at newlines.' },
-  contentBase64: { type: 'string', description: 'Raw bytes (base64) to write in binary mode. Mutually exclusive with content.' },
+  contentBase64: { type: 'string', description: 'Raw bytes (base64) to write in binary or record mode. Mutually exclusive with content.' },
   dataType: {
     type: 'string',
-    enum: ['text', 'binary'],
-    description: 'Transfer mode for `content`. text (default): server ASCII->EBCDIC conversion. binary: bytes are stored as-is, split at LRECL. contentBase64 always implies binary.',
+    enum: ['text', 'binary', 'record'],
+    description:
+      'Transfer mode for the body. text (default): server ASCII->EBCDIC conversion. binary: bytes stored as-is, split at LRECL. record: contentBase64 carries a 4-byte big-endian length before each record (z/OSMF only; mvsMF accepts the header but stores garbage).',
   },
+  fileEncoding: FILE_ENCODING,
   encoding: {
     type: 'string',
     enum: ['cp037', 'cp1047'],
     description:
-      'Translate `content` locally with this EBCDIC code page, pad each line to LRECL and write in binary, bypassing the server\'s text conversion (RECFM F/FB only; lines longer than LRECL are rejected before anything is written). Use cp1047 so [ ] ^ land where JCC and other 1047-expecting tools want them.',
+      "Translate `content` locally with this EBCDIC code page, pad each line to LRECL and write in binary, bypassing the server's text conversion (RECFM F/FB only; lines longer than LRECL are rejected before anything is written). Needed on mvsMF so [ ] ^ land where JCC and other 1047-expecting tools want them; on z/OSMF prefer fileEncoding.",
   },
+  migratedRecall: MIGRATED_RECALL,
   ifMatch: { type: 'string', description: 'Optimistic lock: an ETag from an earlier read (or "*" = must exist). The write is refused with 412 if the target changed.' },
   returnEtag: { type: 'boolean', description: 'Return the ETag of the target as it stands after the write (needed for the next ifMatch).' },
 };
 
 const USS_READ_OPTS = {
   dataType: { type: 'string', enum: ['text', 'binary'], description: 'text (default): server EBCDIC->ASCII conversion. binary: raw bytes returned as bodyBase64.' },
+  fileEncoding: FILE_ENCODING,
+  recordRange: DS_READ_OPTS.recordRange,
   returnEtag: DS_READ_OPTS.returnEtag,
   ifNoneMatch: DS_READ_OPTS.ifNoneMatch,
 };
@@ -293,15 +365,28 @@ const USS_WRITE_OPTS = {
   content: { type: 'string', description: 'Text content to write.' },
   contentBase64: DS_WRITE_OPTS.contentBase64,
   dataType: { type: 'string', enum: ['text', 'binary'], description: 'Transfer mode for `content`. contentBase64 always implies binary.' },
+  fileEncoding: FILE_ENCODING,
   ifMatch: DS_WRITE_OPTS.ifMatch,
   returnEtag: DS_WRITE_OPTS.returnEtag,
 };
 
-const TOOLS = [
+const JOB_MODIFY_OPTS = {
+  jobname: { type: 'string' },
+  jobid: { type: 'string' },
+  synchronous: {
+    type: 'boolean',
+    description: 'X-IBM-Job-Modify-Version 2.0: wait for JES to complete the request and return its outcome (default true). false = 1.0, queue it and return 202.',
+  },
+};
+
+// In mvsmf mode the dataType enums lose "record" on writes (accepted, not implemented).
+const MVSMF_ENUM_DROP = { dataType: ['record'] };
+
+const ALL_TOOLS = [
   {
-    name: 'mvsmfInfo',
+    name: 'zosmfInfo',
     description:
-      'Get z/OSMF system information from the mvsMF instance (GET /zosmf/info). Requires valid credentials; a real z/OSMF also 401s this endpoint without auth.',
+      'Get z/OSMF system information (GET /zosmf/info): z/OS and z/OSMF versions, hostname, plugins. Requires valid credentials on both z/OSMF and mvsMF.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
 
@@ -317,6 +402,11 @@ const TOOLS = [
         volser: { type: 'string', description: 'Optional volume serial filter' },
         start: { type: 'string', description: 'Optional starting data set name for pagination (inclusive)' },
         maxItems: { type: 'integer', description: 'Optional max items (X-IBM-Max-Items), 0 = unlimited' },
+        attributes: zo({
+          type: 'string',
+          enum: ['dsname', 'base', 'vol'],
+          description: 'X-IBM-Attributes: dsname = names only, base (default here) = DCB/space attributes, vol = names plus volume. z/OSMF itself defaults to dsname.',
+        }),
       },
       required: ['dslevel'],
       additionalProperties: false,
@@ -325,7 +415,7 @@ const TOOLS = [
   {
     name: 'createDataset',
     description:
-      'Allocate a new sequential (PS) or partitioned (PO) data set (POST /zosmf/restfiles/ds/{name}). Either give dsorg/recfm/lrecl/blksize/primary explicitly, or `like` an existing data set and override any of them. Caution: allocates real DASD space on the guest. Every allocation failure (name exists, no space, not authorized) answers 500 "Dynamic allocation Error".',
+      'Allocate a new sequential (PS) or partitioned (PO) data set (POST /zosmf/restfiles/ds/{name}). Either give dsorg/recfm/lrecl/blksize/primary explicitly, or `like` an existing data set and override any of them. Caution: allocates real DASD space. On mvsMF every allocation failure (name exists, no space, not authorized) answers 500 "Dynamic allocation Error".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -339,6 +429,13 @@ const TOOLS = [
         secondary: { type: 'integer', description: 'Secondary space allocation (default 0)' },
         dirblk: { type: 'integer', description: 'Directory blocks for a PDS (default 0; 20 when modelling a PO target with `like`)' },
         alcunit: { type: 'string', enum: ['TRK', 'CYL', 'BLK'], description: 'Allocation unit (default TRK)' },
+        dsntype: zo({ type: 'string', enum: ['LIBRARY', 'PDS', 'LARGE', 'BASIC', 'EXTREQ', 'EXTPREF', 'HFS'], description: 'Data set type; LIBRARY = PDS/E.' }),
+        volser: zo({ type: 'string', description: 'Volume to allocate on' }),
+        unit: zo({ type: 'string', description: 'Device type / esoteric, e.g. "3390", "SYSDA"' }),
+        avgblk: zo({ type: 'integer', description: 'Average block length for alcunit BLK' }),
+        storclass: zo({ type: 'string', description: 'SMS storage class' }),
+        mgntclass: zo({ type: 'string', description: 'SMS management class' }),
+        dataclass: zo({ type: 'string', description: 'SMS data class' }),
       },
       required: ['dsname'],
       additionalProperties: false,
@@ -350,7 +447,7 @@ const TOOLS = [
       'Uncatalog and scratch a data set (DELETE /zosmf/restfiles/ds/{name}). Caution: irreversibly destroys the data set and all its members.',
     inputSchema: {
       type: 'object',
-      properties: { dsname: { type: 'string', description: 'Fully qualified data set name' } },
+      properties: { dsname: { type: 'string', description: 'Fully qualified data set name' }, volser: DS_VOLSER },
       required: ['dsname'],
       additionalProperties: false,
     },
@@ -358,10 +455,10 @@ const TOOLS = [
   {
     name: 'readDataset',
     description:
-      'Read the content of a sequential (PS) data set (GET /zosmf/restfiles/ds/{name}). PDS data sets return 400; use readMember instead. Supports text/binary/record transfer, local code-page decoding, and ETag conditional reads.',
+      'Read the content of a sequential (PS) data set (GET /zosmf/restfiles/ds/{name}). PDS data sets return 400; use readMember instead. Supports text/binary/record transfer, server or local code-page selection, record ranges, and ETag conditional reads.',
     inputSchema: {
       type: 'object',
-      properties: { dsname: { type: 'string', description: 'Fully qualified data set name' }, ...DS_READ_OPTS },
+      properties: { dsname: { type: 'string', description: 'Fully qualified data set name' }, volser: DS_VOLSER, ...DS_READ_OPTS },
       required: ['dsname'],
       additionalProperties: false,
     },
@@ -369,11 +466,66 @@ const TOOLS = [
   {
     name: 'writeDataset',
     description:
-      'Write/overwrite the content of a sequential (PS) data set (PUT /zosmf/restfiles/ds/{name}). Caution: replaces the existing content of a real MVS data set; an empty body truncates it. The data set must already exist (see createDataset).',
+      'Write/overwrite the content of a sequential (PS) data set (PUT /zosmf/restfiles/ds/{name}). Caution: replaces the existing content of a real data set; an empty body truncates it. The data set must already exist (see createDataset).',
     inputSchema: {
       type: 'object',
-      properties: { dsname: { type: 'string', description: 'Fully qualified data set name' }, ...DS_WRITE_OPTS },
+      properties: { dsname: { type: 'string', description: 'Fully qualified data set name' }, volser: DS_VOLSER, ...DS_WRITE_OPTS },
       required: ['dsname'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'renameDataset',
+    description:
+      'Rename a data set, or a member within a PDS (PUT /zosmf/restfiles/ds/{new} with a {"request":"rename"} body). Give `member` and `newMember` to rename a member (dsname stays the same); otherwise the whole data set is renamed to `newDsname`. Caution: JCL and catalog references to the old name break.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        dsname: { type: 'string', description: 'Current data set name' },
+        newDsname: { type: 'string', description: 'New data set name (data set rename)' },
+        member: { type: 'string', description: 'Current member name (member rename)' },
+        newMember: { type: 'string', description: 'New member name (member rename)' },
+        enq: zo({ type: 'string', enum: ['EXCL', 'SHRW'], description: 'Serialization on the source (default EXCL).' }),
+      },
+      required: ['dsname'],
+      additionalProperties: false,
+    },
+  },
+  {
+    zosmfOnly: true,
+    name: 'copyDataset',
+    description:
+      'Copy a sequential data set or a PDS member to another data set/member (PUT /zosmf/restfiles/ds/{target} with a {"request":"copy"} body). Omit fromMember/toMember to copy a whole sequential data set; give fromMember "*" to copy all members of a PDS. Caution: replace=true overwrites the target.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fromDsname: { type: 'string', description: 'Source data set' },
+        fromMember: { type: 'string', description: 'Source member, or "*" for all members' },
+        toDsname: { type: 'string', description: 'Target data set (must exist)' },
+        toMember: { type: 'string', description: 'Target member' },
+        fromVolser: { type: 'string', description: 'Source volume, for an uncataloged source' },
+        alias: { type: 'boolean', description: 'Also copy member aliases (default false)' },
+        replace: { type: 'boolean', description: 'Overwrite existing target members (default false)' },
+        enq: { type: 'string', enum: ['SHR', 'SHRW', 'EXCLU'], description: 'Serialization on the source (default SHR).' },
+      },
+      required: ['fromDsname', 'toDsname'],
+      additionalProperties: false,
+    },
+  },
+  {
+    zosmfOnly: true,
+    name: 'hsmRequest',
+    description:
+      'Issue a DFSMShsm request against a data set (PUT /zosmf/restfiles/ds/{name}): hrecall brings a migrated data set back, hmigrate migrates it, hdelete deletes the migrated copy. Caution: hdelete destroys data; hmigrate makes the next access slow.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        dsname: { type: 'string', description: 'Fully qualified data set name' },
+        request: { type: 'string', enum: ['hrecall', 'hmigrate', 'hdelete'] },
+        wait: { type: 'boolean', description: 'Wait for HSM to finish before answering (default false)' },
+        purge: { type: 'boolean', description: 'hdelete only: also purge the data set from the HSM backup/migration control data (default false)' },
+      },
+      required: ['dsname', 'request'],
       additionalProperties: false,
     },
   },
@@ -385,9 +537,11 @@ const TOOLS = [
       type: 'object',
       properties: {
         dsname: { type: 'string', description: 'PDS name' },
+        volser: DS_VOLSER,
         pattern: { type: 'string', description: 'Member name filter: * matches any run of characters, % exactly one; e.g. "JES2*", "IEF%%%01"' },
         start: { type: 'string', description: 'Starting member name for pagination (inclusive, EBCDIC collation)' },
         maxItems: { type: 'integer', description: 'Max members to return (X-IBM-Max-Items), 0/omitted = all' },
+        attributes: zo({ type: 'string', enum: ['member', 'base'], description: 'X-IBM-Attributes: member = names only (default), base = ISPF statistics (vers, mod, created, changed, user…) too.' }),
       },
       required: ['dsname'],
       additionalProperties: false,
@@ -396,12 +550,13 @@ const TOOLS = [
   {
     name: 'readMember',
     description:
-      'Read a single PDS member (GET /zosmf/restfiles/ds/{name}({member})). Supports text/binary/record transfer, local code-page decoding (encoding=cp1047 for JCC-style source with real brackets), and ETag conditional reads.',
+      'Read a single PDS member (GET /zosmf/restfiles/ds/{name}({member})). Supports text/binary/record transfer, server or local code-page selection (encoding=cp1047 on mvsMF for JCC-style source with real brackets), record ranges, and ETag conditional reads.',
     inputSchema: {
       type: 'object',
       properties: {
         dsname: { type: 'string', description: 'PDS name' },
         member: { type: 'string', description: 'Member name (max 8 chars)' },
+        volser: DS_VOLSER,
         ...DS_READ_OPTS,
       },
       required: ['dsname', 'member'],
@@ -411,12 +566,13 @@ const TOOLS = [
   {
     name: 'writeMember',
     description:
-      'Write/overwrite a single PDS member (PUT /zosmf/restfiles/ds/{name}({member})), creating it if absent. Caution: replaces the existing content of a real MVS PDS member; an empty body truncates it. Use ifMatch to avoid clobbering a concurrent edit.',
+      'Write/overwrite a single PDS member (PUT /zosmf/restfiles/ds/{name}({member})), creating it if absent. Caution: replaces the existing content of a real PDS member; an empty body truncates it. Use ifMatch to avoid clobbering a concurrent edit.',
     inputSchema: {
       type: 'object',
       properties: {
         dsname: { type: 'string', description: 'PDS name' },
         member: { type: 'string', description: 'Member name (max 8 chars)' },
+        volser: DS_VOLSER,
         ...DS_WRITE_OPTS,
       },
       required: ['dsname', 'member'],
@@ -432,6 +588,7 @@ const TOOLS = [
       properties: {
         dsname: { type: 'string', description: 'PDS name' },
         member: { type: 'string', description: 'Member name (max 8 chars)' },
+        volser: DS_VOLSER,
       },
       required: ['dsname', 'member'],
       additionalProperties: false,
@@ -448,6 +605,11 @@ const TOOLS = [
       properties: {
         path: { type: 'string', description: 'Absolute USS directory or file path, e.g. "/u/herc01"' },
         maxItems: { type: 'integer', description: 'Max entries to return (X-IBM-Max-Items). Server default 1000; 0 = unlimited' },
+        name: zo({ type: 'string', description: 'Only entries whose name matches this pattern (shell wildcards)' }),
+        depth: zo({ type: 'integer', description: 'How many directory levels to descend (default 1)' }),
+        type: zo({ type: 'string', enum: ['f', 'd', 'l', 'c', 'b', 'p', 's'], description: 'Only entries of this type (file, directory, symlink, …)' }),
+        filesys: zo({ type: 'string', enum: ['all', 'same'], description: 'Whether to cross mount points (default same)' }),
+        symlinks: zo({ type: 'string', enum: ['follow', 'report'], description: 'Follow symlinks or report them as-is' }),
       },
       required: ['path'],
       additionalProperties: false,
@@ -455,7 +617,7 @@ const TOOLS = [
   },
   {
     name: 'readUssFile',
-    description: 'Read the content of a USS file (GET /zosmf/restfiles/fs/{filepath}). Files are capped at 64 KB by UFSD.',
+    description: 'Read the content of a USS file (GET /zosmf/restfiles/fs/{filepath}). On mvsMF (UFSD) files are capped at 64 KB.',
     inputSchema: {
       type: 'object',
       properties: { path: { type: 'string', description: 'Absolute USS file path, e.g. "/u/herc01/profile"' }, ...USS_READ_OPTS },
@@ -466,7 +628,7 @@ const TOOLS = [
   {
     name: 'writeUssFile',
     description:
-      'Write/overwrite the content of a USS file (PUT /zosmf/restfiles/fs/{filepath}), creating it if absent. Caution: replaces the existing content of a real file. Files are capped at 64 KB by UFSD.',
+      'Write/overwrite the content of a USS file (PUT /zosmf/restfiles/fs/{filepath}), creating it if absent. Caution: replaces the existing content of a real file. On mvsMF (UFSD) files are capped at 64 KB.',
     inputSchema: {
       type: 'object',
       properties: { path: { type: 'string', description: 'Absolute USS file path' }, ...USS_WRITE_OPTS },
@@ -477,7 +639,7 @@ const TOOLS = [
   {
     name: 'createUssFile',
     description:
-      'Create a new USS file or directory (POST /zosmf/restfiles/fs/{filepath}). Caution: creates real filesystem entries on the guest. Fails with 400 if the path already exists.',
+      'Create a new USS file or directory (POST /zosmf/restfiles/fs/{filepath}). Caution: creates real filesystem entries. Fails with 400 if the path already exists.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -492,7 +654,7 @@ const TOOLS = [
   {
     name: 'deleteUssFile',
     description:
-      'Delete a USS file or directory (DELETE /zosmf/restfiles/fs/{filepath}). Caution: irreversibly removes a real file or directory from the guest.',
+      'Delete a USS file or directory (DELETE /zosmf/restfiles/fs/{filepath}). Caution: irreversibly removes a real file or directory.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -503,20 +665,103 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    zosmfOnly: true,
+    name: 'chmodUssFile',
+    description: 'Change the permissions of a USS file or directory (PUT /zosmf/restfiles/fs/{filepath}, {"request":"chmod"}).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute USS path' },
+        mode: { type: 'string', description: 'Octal ("755") or symbolic ("u+x,go-w") mode' },
+        recursive: { type: 'boolean', description: 'Apply to a directory tree (default false)' },
+        links: { type: 'string', enum: ['follow', 'suppress'], description: 'Follow symlinks or leave them alone (default follow)' },
+      },
+      required: ['path', 'mode'],
+      additionalProperties: false,
+    },
+  },
+  {
+    zosmfOnly: true,
+    name: 'chownUssFile',
+    description: 'Change the owner and/or group of a USS file or directory (PUT /zosmf/restfiles/fs/{filepath}, {"request":"chown"}).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute USS path' },
+        owner: { type: 'string', description: 'New owner (user id or UID)' },
+        group: { type: 'string', description: 'New group (name or GID)' },
+        recursive: { type: 'boolean', description: 'Apply to a directory tree (default false)' },
+        links: { type: 'string', enum: ['follow', 'suppress', 'change'], description: 'Symlink handling (default follow)' },
+      },
+      required: ['path', 'owner'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'chtagUssFile',
+    description:
+      'List, set or remove the file tag (code page) of a USS file (PUT /zosmf/restfiles/fs/{filepath}, {"request":"chtag"}). mvsMF has no file tagging: list reports untagged and set/remove are accepted as no-ops.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute USS path' },
+        action: { type: 'string', enum: ['list', 'set', 'remove'] },
+        type: zo({ type: 'string', enum: ['binary', 'text', 'mixed'], description: 'set only: tag type (default mixed)' }),
+        codeset: zo({ type: 'string', description: 'set only: code set, e.g. "IBM-1047", "ISO8859-1"' }),
+        recursive: zo({ type: 'boolean', description: 'Apply to a directory tree (default false)' }),
+        links: zo({ type: 'string', enum: ['follow', 'suppress', 'change'], description: 'Symlink handling (default follow)' }),
+      },
+      required: ['path', 'action'],
+      additionalProperties: false,
+    },
+  },
+  {
+    zosmfOnly: true,
+    name: 'moveUssFile',
+    description: 'Move or rename a USS file or directory (PUT /zosmf/restfiles/fs/{to}, {"request":"move","from":…}). Caution: overwrite=true replaces an existing target.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: 'Current absolute USS path' },
+        to: { type: 'string', description: 'New absolute USS path' },
+        overwrite: { type: 'boolean', description: 'Replace an existing target (default false)' },
+      },
+      required: ['from', 'to'],
+      additionalProperties: false,
+    },
+  },
+  {
+    zosmfOnly: true,
+    name: 'copyUssFile',
+    description: 'Copy a USS file or directory (PUT /zosmf/restfiles/fs/{to}, {"request":"copy","from":…}). Caution: overwrite=true replaces an existing target.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: 'Source absolute USS path' },
+        to: { type: 'string', description: 'Target absolute USS path' },
+        overwrite: { type: 'boolean', description: 'Replace an existing target (default false)' },
+        recursive: { type: 'boolean', description: 'Copy a directory tree (default false)' },
+      },
+      required: ['from', 'to'],
+      additionalProperties: false,
+    },
+  },
 
   // --- Jobs ---
   {
     name: 'listJobs',
-    description: 'List JES2 jobs (GET /zosmf/restjobs/jobs). Owner defaults to the authenticated user; pass owner "*" for everyone.',
+    description: 'List JES jobs (GET /zosmf/restjobs/jobs). Owner defaults to the authenticated user; pass owner "*" for everyone.',
     inputSchema: {
       type: 'object',
       properties: {
         owner: { type: 'string', description: 'Job owner filter, "*" for all owners' },
         prefix: { type: 'string', description: 'Job name prefix filter, "*" for all' },
         jobid: { type: 'string', description: 'Specific job id filter' },
-        status: { type: 'string', description: 'INPUT|ACTIVE|OUTPUT|* (also XMIT/SETUP/RECEIVE/UNKNOWN on 3.8j)' },
+        status: { type: 'string', description: 'INPUT|ACTIVE|OUTPUT|* (also XMIT/SETUP/RECEIVE/UNKNOWN on MVS 3.8j)' },
         maxJobs: { type: 'integer', description: 'Max jobs returned, 1-1000 (default 1000)' },
         execData: { type: 'boolean', description: 'Include exec-started / exec-ended timestamps (UTC)' },
+        userCorrelator: zo({ type: 'string', description: 'Only jobs submitted with this user correlator (X-IBM-User-Correlator)' }),
       },
       additionalProperties: false,
     },
@@ -524,13 +769,14 @@ const TOOLS = [
   {
     name: 'getJobStatus',
     description:
-      "Get a job's status (GET /zosmf/restjobs/jobs/{jobname}/{jobid}). retcode is null until the job finishes (and always null without the SYZJ201 usermod).",
+      "Get a job's status (GET /zosmf/restjobs/jobs/{jobname}/{jobid}). retcode is null until the job finishes (on mvsMF: always null without the SYZJ201 usermod).",
     inputSchema: {
       type: 'object',
       properties: {
         jobname: { type: 'string' },
         jobid: { type: 'string' },
         execData: { type: 'boolean', description: 'Include exec-started / exec-ended timestamps (UTC)' },
+        stepData: zo({ type: 'boolean', description: 'Include per-step completion codes (step-data=Y)' }),
       },
       required: ['jobname', 'jobid'],
       additionalProperties: false,
@@ -552,46 +798,24 @@ const TOOLS = [
   {
     name: 'readJobFile',
     description:
-      'Read the record content of one job spool file (GET /zosmf/restjobs/jobs/{jobname}/{jobid}/files/{ddid}/records). A 404 with reason 10 means JES2 already purged that spool output.',
+      'Read the record content of one job spool file (GET /zosmf/restjobs/jobs/{jobname}/{jobid}/files/{ddid}/records). On mvsMF a 404 with reason 10 means JES2 already purged that spool output.',
     inputSchema: {
       type: 'object',
       properties: {
         jobname: { type: 'string' },
         jobid: { type: 'string' },
         ddid: { type: 'string', description: 'Spool file id (ddid) from listJobFiles' },
+        recordRange: zo({ type: 'string', description: 'Subset of records (X-IBM-Record-Range): "start-end" or "start,count".' }),
+        fileEncoding: FILE_ENCODING,
       },
       required: ['jobname', 'jobid', 'ddid'],
       additionalProperties: false,
     },
   },
   {
-    name: 'submitJob',
-    description:
-      'Submit a job by inline JCL text (PUT /zosmf/restjobs/jobs, Content-Type: text/plain). Use with care: this executes real batch work on the guest MVS system. mvsMF appends USER=/PASSWORD= (and NOTIFY=$MVSMF if the card has none) to the JOB statement. The JOB statement needs a programmer name or MVS flushes it with a JCL ERROR.',
-    inputSchema: {
-      type: 'object',
-      properties: { jcl: { type: 'string', description: 'Full inline JCL text, including the JOB card' } },
-      required: ['jcl'],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'submitJobFromDataset',
-    description:
-      'Submit a job whose JCL is in a data set or PDS member (PUT /zosmf/restjobs/jobs, Content-Type: application/json). Use with care: this executes real batch work on the guest MVS system. Unlike inline submit, the JCL bytes are read from DASD as stored, so source written with encoding=cp1047 keeps its code points.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        dsname: { type: 'string', description: 'Data set holding the JCL, e.g. "HERC01.JCL(MYJOB)" or "HERC01.JOB.JCL"' },
-      },
-      required: ['dsname'],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'purgeJob',
-    description:
-      'Purge/cancel a job from JES2 (DELETE /zosmf/restjobs/jobs/{jobname}/{jobid}). Caution: removes a job from the queue, including an active one; irreversible. Started tasks and TSO users are refused with 400.',
+    zosmfOnly: true,
+    name: 'getJobJcl',
+    description: 'Retrieve the JCL a job was submitted with (GET /zosmf/restjobs/jobs/{jobname}/{jobid}/files/JCL/records).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -602,23 +826,122 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'submitJob',
+    description:
+      'Submit a job by inline JCL text (PUT /zosmf/restjobs/jobs, Content-Type: text/plain). Use with care: this executes real batch work. On mvsMF the server appends USER=/PASSWORD= (and NOTIFY=$MVSMF if the card has none) to the JOB statement, and the JOB statement needs a programmer name or MVS flushes it with a JCL ERROR.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jcl: { type: 'string', description: 'Full inline JCL text, including the JOB card' },
+        intrdrClass: zo({ type: 'string', description: 'Internal reader class (X-IBM-Intrdr-Class), one character' }),
+        intrdrRecfm: zo({ type: 'string', enum: ['F', 'V'], description: 'Record format of the JCL (X-IBM-Intrdr-Recfm), default F' }),
+        intrdrLrecl: zo({ type: 'integer', description: 'Record length of the JCL (X-IBM-Intrdr-Lrecl), default 80' }),
+        symbols: zo({
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: 'JCL symbols to substitute (X-IBM-JCL-Symbol-<name>), e.g. {"HLQ":"USER1"}. Names max 8 chars.',
+        }),
+        notificationUrl: zo({ type: 'string', description: 'URL z/OSMF calls back when the job ends (X-IBM-Notification-URL)' }),
+      },
+      required: ['jcl'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'submitJobFromDataset',
+    description:
+      'Submit a job whose JCL is in a data set or PDS member (PUT /zosmf/restjobs/jobs, Content-Type: application/json). Use with care: this executes real batch work. The JCL bytes are read from DASD as stored, so source written with encoding=cp1047 keeps its code points.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        dsname: { type: 'string', description: 'Data set holding the JCL, e.g. "HERC01.JCL(MYJOB)" or "HERC01.JOB.JCL"' },
+        intrdrClass: zo({ type: 'string', description: 'Internal reader class (X-IBM-Intrdr-Class), one character' }),
+        symbols: zo({ type: 'object', additionalProperties: { type: 'string' }, description: 'JCL symbols to substitute (X-IBM-JCL-Symbol-<name>)' }),
+        notificationUrl: zo({ type: 'string', description: 'URL z/OSMF calls back when the job ends (X-IBM-Notification-URL)' }),
+      },
+      required: ['dsname'],
+      additionalProperties: false,
+    },
+  },
+  {
+    zosmfOnly: true,
+    name: 'submitJobFromUssFile',
+    description: 'Submit a job whose JCL is in a USS file (PUT /zosmf/restjobs/jobs, {"file":"/u/…"}). Use with care: this executes real batch work.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute USS path of the JCL file' },
+        intrdrClass: { type: 'string', description: 'Internal reader class (X-IBM-Intrdr-Class), one character' },
+        symbols: { type: 'object', additionalProperties: { type: 'string' }, description: 'JCL symbols to substitute (X-IBM-JCL-Symbol-<name>)' },
+        notificationUrl: { type: 'string', description: 'URL z/OSMF calls back when the job ends (X-IBM-Notification-URL)' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'purgeJob',
+    description:
+      'Purge/cancel a job from JES (DELETE /zosmf/restjobs/jobs/{jobname}/{jobid}). Caution: removes a job from the queue, including an active one; irreversible. On mvsMF started tasks and TSO users are refused with 400.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobname: { type: 'string' },
+        jobid: { type: 'string' },
+        synchronous: zo(JOB_MODIFY_OPTS.synchronous),
+      },
+      required: ['jobname', 'jobid'],
+      additionalProperties: false,
+    },
+  },
+  {
+    zosmfOnly: true,
+    name: 'cancelJob',
+    description: 'Cancel a running job but keep its output (PUT /zosmf/restjobs/jobs/{jobname}/{jobid}, {"request":"cancel"}). Caution: stops real work.',
+    inputSchema: { type: 'object', properties: JOB_MODIFY_OPTS, required: ['jobname', 'jobid'], additionalProperties: false },
+  },
+  {
+    zosmfOnly: true,
+    name: 'holdJob',
+    description: 'Hold a job in the input queue (PUT /zosmf/restjobs/jobs/{jobname}/{jobid}, {"request":"hold"}).',
+    inputSchema: { type: 'object', properties: JOB_MODIFY_OPTS, required: ['jobname', 'jobid'], additionalProperties: false },
+  },
+  {
+    zosmfOnly: true,
+    name: 'releaseJob',
+    description: 'Release a held job (PUT /zosmf/restjobs/jobs/{jobname}/{jobid}, {"request":"release"}).',
+    inputSchema: { type: 'object', properties: JOB_MODIFY_OPTS, required: ['jobname', 'jobid'], additionalProperties: false },
+  },
+  {
+    zosmfOnly: true,
+    name: 'changeJobClass',
+    description: 'Change the execution class of a queued job (PUT /zosmf/restjobs/jobs/{jobname}/{jobid}, {"class":"X"}).',
+    inputSchema: {
+      type: 'object',
+      properties: { ...JOB_MODIFY_OPTS, class: { type: 'string', description: 'New job class, one character' } },
+      required: ['jobname', 'jobid', 'class'],
+      additionalProperties: false,
+    },
+  },
 
   // --- Console services ---
   {
     name: 'issueConsoleCommand',
     description:
-      'Issue an MVS operator command (PUT /zosmf/restconsoles/consoles/{consoleName}). Caution: operator commands can affect the whole shared MVS guest (start/stop subsystems, cancel jobs, etc) and mvsMF applies no per-command authorization. Returns cmd-response (what arrived before the reply went quiet, ~0.3-3 s) plus a cmd-response-key for getConsoleMessages; with unsolKey also a detection-key for getConsoleDetections. A 429 or 503/8/17 means the command was NOT issued and may be retried; 503/8/15 means it WAS issued but the response was lost.',
+      'Issue an MVS operator command (PUT /zosmf/restconsoles/consoles/{consoleName}). Caution: operator commands can affect the whole system (start/stop subsystems, cancel jobs, etc); mvsMF applies no per-command authorization. Returns cmd-response (what arrived before the reply went quiet) plus a cmd-response-key for getConsoleMessages; with unsolKey also a detection-key for getConsoleDetections. On mvsMF a 429 or 503/8/17 means the command was NOT issued and may be retried; 503/8/15 means it WAS issued but the response was lost.',
     inputSchema: {
       type: 'object',
       properties: {
         cmd: { type: 'string', description: 'Operator command text, max 126 chars, e.g. "D T" or "D A,L"' },
         consoleName: { type: 'string', description: 'Console name, 2-8 chars. Default "defcn".' },
-        async: { type: 'boolean', description: 'Return only the response key, not cmd-response (no faster; saves payload only).' },
+        async: { type: 'boolean', description: 'Return only the response key, not cmd-response.' },
         solKey: { type: 'string', description: 'Substring to look for in the solicited response; sets sol-key-detected in the result.' },
         unsolKey: { type: 'string', description: 'Arm detection of an unsolicited message containing this substring (e.g. "FTPD054I" after "S FTPD"). Returns a detection-key.' },
         unsolDetectSync: { type: 'boolean', description: 'With unsolKey: block up to unsolDetectTimeout and return status/msg inline instead of a detection-key.' },
         unsolDetectTimeout: { type: 'integer', description: 'Seconds to block in sync detection (default 20, max 60).' },
         detectTime: { type: 'integer', description: 'Seconds the async detection stays armed (default 30).' },
+        system: zo({ type: 'string', description: 'Sysplex member to route the command to (default: the local system)' }),
       },
       required: ['cmd'],
       additionalProperties: false,
@@ -627,7 +950,7 @@ const TOOLS = [
   {
     name: 'getConsoleMessages',
     description:
-      'Collect response lines that arrived after issueConsoleCommand returned (GET /zosmf/restconsoles/consoles/{consoleName}/solmsgs/{key}). Each call returns only new lines; "" means nothing new (or the key aged out of the trace table).',
+      'Collect response lines that arrived after issueConsoleCommand returned (GET /zosmf/restconsoles/consoles/{consoleName}/solmsgs/{key}). Each call returns only new lines; "" means nothing new (or the key aged out).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -641,7 +964,7 @@ const TOOLS = [
   {
     name: 'getConsoleDetections',
     description:
-      'Poll an unsolicited-message detection armed by issueConsoleCommand with unsolKey (GET /zosmf/restconsoles/consoles/{consoleName}/detections/{key}). status is waiting, detected (msg holds the message) or expired. An unknown/evicted key answers 500 / 5 / 9.',
+      'Poll an unsolicited-message detection armed by issueConsoleCommand with unsolKey (GET /zosmf/restconsoles/consoles/{consoleName}/detections/{key}). status is waiting, detected (msg holds the message) or expired.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -655,7 +978,7 @@ const TOOLS = [
   {
     name: 'getHardcopyLog',
     description:
-      'Retrieve hardcopy log (SYSLOG / Master Trace Table) messages over a time window (GET /zosmf/restconsoles/v1/log). Default: the last 10 minutes ending now. Items are oldest-first; nextTimestamp is the far edge of the window for paging.',
+      'Retrieve hardcopy log (SYSLOG / OPERLOG) messages over a time window (GET /zosmf/restconsoles/v1/log). Default: the last 10 minutes ending now. Items are oldest-first; nextTimestamp is the far edge of the window for paging.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -663,13 +986,88 @@ const TOOLS = [
         time: { type: 'string', description: 'ISO 8601 UTC anchor, e.g. "2026-06-30T02:00:00Z". Default now.' },
         timestamp: { type: 'integer', description: 'UNIX millisecond anchor; overrides time. Use a previous nextTimestamp to page.' },
         direction: { type: 'string', enum: ['backward', 'forward'], description: 'Direction from the anchor. Default backward.' },
-        hardcopy: { type: 'string', enum: ['syslog', 'operlog'], description: 'Log source; operlog falls back to SYSLOG on 3.8j.' },
-        sysName: { type: 'string', description: 'System name, max 8 chars. Only the local system is supported.' },
+        hardcopy: { type: 'string', enum: ['syslog', 'operlog'], description: 'Log source; on mvsMF operlog falls back to SYSLOG.' },
+        sysName: { type: 'string', description: 'System name, max 8 chars.' },
       },
       additionalProperties: false,
     },
   },
+
+  // --- TSO ---
+  {
+    zosmfOnly: true,
+    name: 'issueTsoCommand',
+    description:
+      'Run one TSO/E command in a fresh address space and return its output (PUT /zosmf/tsoApp/v1/tso, stateless). Needs z/OSMF 2.4 or later with the TSO/E address space services enabled. Caution: runs a real TSO command under your userid.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'TSO command text, e.g. "LISTCAT LEVEL(USER1)"' },
+        account: { type: 'string', description: 'Accounting information for the address space (acct), if your site requires one' },
+        proc: { type: 'string', description: 'Logon procedure (default IZUFPROC)' },
+        regionSize: { type: 'integer', description: 'Region size in KB (default 4096)' },
+        characterSet: { type: 'string', description: 'Character set (default 697)' },
+        codePage: { type: 'string', description: 'Code page (default 1047)' },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  },
 ];
+
+// Build the tool list for the active mode: drop z/OSMF-only tools, drop
+// z/OSMF-only properties, trim enums mvsMF cannot honor, and strip the markers.
+function toolsForMode(mvsmf) {
+  const out = [];
+  for (const { zosmfOnly, ...tool } of ALL_TOOLS) {
+    if (mvsmf && zosmfOnly) continue;
+    const props = {};
+    for (const [key, prop] of Object.entries(tool.inputSchema.properties)) {
+      if (mvsmf && prop[ZOSMF_ONLY]) continue;
+      const clean = { ...prop };
+      if (mvsmf && clean.enum && MVSMF_ENUM_DROP[key]) {
+        clean.enum = clean.enum.filter((v) => !MVSMF_ENUM_DROP[key].includes(v));
+      }
+      props[key] = clean;
+    }
+    out.push({ ...tool, inputSchema: { ...tool.inputSchema, properties: props } });
+  }
+  return out;
+}
+
+const TOOLS = toolsForMode(MVSMF);
+const TOOL_INDEX = new Map(TOOLS.map((t) => [t.name, t]));
+const ZOSMF_TOOL_INDEX = new Map(ALL_TOOLS.map((t) => [t.name, t]));
+
+// Check a call against the active mode's schema: unknown or disabled options,
+// enum values and required fields. The low-level Server does not validate.
+function callArgs(name, args) {
+  const tool = TOOL_INDEX.get(name);
+  if (!tool) {
+    if (ZOSMF_TOOL_INDEX.has(name)) throw new Error(`Tool "${name}" is not supported by mvsMF and is disabled in mvsmf compatibility mode (ZOSMF_MODE=mvsmf).`);
+    throw new Error(`Unknown tool: ${name}`);
+  }
+  const { properties, required = [] } = tool.inputSchema;
+  for (const key of Object.keys(args)) {
+    if (args[key] === undefined) continue;
+    const prop = properties[key];
+    if (!prop) {
+      if (ZOSMF_TOOL_INDEX.get(name).inputSchema.properties[key]) {
+        throw new Error(`Option "${key}" of ${name} is not supported by mvsMF and is disabled in mvsmf compatibility mode.`);
+      }
+      throw new Error(`Unknown option "${key}" for ${name}.`);
+    }
+    if (prop.enum && !prop.enum.includes(args[key])) {
+      const full = ZOSMF_TOOL_INDEX.get(name).inputSchema.properties[key]?.enum || [];
+      const why = full.includes(args[key]) ? 'is not supported by mvsMF and is disabled in mvsmf compatibility mode' : `is not one of ${prop.enum.join(', ')}`;
+      throw new Error(`${name}: ${key}="${args[key]}" ${why}.`);
+    }
+  }
+  for (const key of required) {
+    if (args[key] === undefined || args[key] === null) throw new Error(`${name}: "${key}" is required.`);
+  }
+  return args;
+}
 
 // ---------------------------------------------------------------------------
 // Dispatch
@@ -679,10 +1077,35 @@ function setIf(params, key, value) {
   if (value !== undefined && value !== null && value !== '') params.set(key, String(value));
 }
 
+// Header set shared by the three submit variants.
+function submitHeaders(args, contentType) {
+  const h = { 'Content-Type': contentType };
+  if (args.intrdrClass) h['X-IBM-Intrdr-Class'] = args.intrdrClass;
+  if (args.intrdrRecfm) h['X-IBM-Intrdr-Recfm'] = args.intrdrRecfm;
+  if (args.intrdrLrecl !== undefined) h['X-IBM-Intrdr-Lrecl'] = String(args.intrdrLrecl);
+  if (args.notificationUrl) h['X-IBM-Notification-URL'] = args.notificationUrl;
+  for (const [k, v] of Object.entries(args.symbols || {})) h[`X-IBM-JCL-Symbol-${k}`] = String(v);
+  return h;
+}
+
+function jobModifyHeaders(args) {
+  return { 'X-IBM-Job-Modify-Version': args.synchronous === false ? '1.0' : '2.0' };
+}
+
+async function jobModify(args, body) {
+  return textResult(
+    await zosmfFetch(jobPath(args.jobname, args.jobid), jsonBody('PUT', { ...body, version: args.synchronous === false ? '1.0' : '2.0' }, jobModifyHeaders(args)))
+  );
+}
+
+async function ussUtility(path, body) {
+  return textResult(await zosmfFetch(`/zosmf/restfiles/fs/${ussPath(path)}`, jsonBody('PUT', body)));
+}
+
 async function callTool(name, args) {
   switch (name) {
-    case 'mvsmfInfo':
-      return textResult(await mvsmfFetch('/zosmf/info'));
+    case 'zosmfInfo':
+      return textResult(await zosmfFetch('/zosmf/info'));
 
     // --- Datasets ---
     case 'listDatasets': {
@@ -691,31 +1114,54 @@ async function callTool(name, args) {
       setIf(params, 'start', args.start);
       const headers = {};
       if (args.maxItems !== undefined) headers['X-IBM-Max-Items'] = String(args.maxItems);
-      return textResult(await mvsmfFetch(`/zosmf/restfiles/ds?${params}`, { headers }));
+      if (!MVSMF) headers['X-IBM-Attributes'] = args.attributes || 'base';
+      return textResult(await zosmfFetch(`/zosmf/restfiles/ds?${params}`, { headers }));
     }
 
     case 'createDataset': {
       const body = {};
-      for (const k of ['like', 'dsorg', 'recfm', 'lrecl', 'blksize', 'primary', 'secondary', 'dirblk', 'alcunit']) {
+      for (const k of ['like', 'dsorg', 'recfm', 'lrecl', 'blksize', 'primary', 'secondary', 'dirblk', 'alcunit', 'dsntype', 'volser', 'unit', 'avgblk', 'storclass', 'mgntclass', 'dataclass']) {
         if (args[k] !== undefined) body[k] = args[k];
       }
-      return textResult(
-        await mvsmfFetch(dsPath(args.dsname), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        })
-      );
+      return textResult(await zosmfFetch(dsPath(args.dsname), jsonBody('POST', body)));
     }
 
     case 'deleteDataset':
-      return textResult(await mvsmfFetch(dsPath(args.dsname), { method: 'DELETE' }));
+      return textResult(await zosmfFetch(dsPath(args.dsname, undefined, args.volser), { method: 'DELETE' }));
 
     case 'readDataset':
-      return readDatasetLike(dsPath(args.dsname), args.dsname, args);
+      return readDatasetLike(dsPath(args.dsname, undefined, args.volser), args.dsname, args);
 
     case 'writeDataset':
-      return writeDatasetLike(dsPath(args.dsname), args.dsname, args);
+      return writeDatasetLike(dsPath(args.dsname, undefined, args.volser), args.dsname, args);
+
+    case 'renameDataset': {
+      const memberRename = args.member !== undefined || args.newMember !== undefined;
+      if (memberRename && !(args.member && args.newMember)) throw new Error('A member rename needs both member and newMember.');
+      if (!memberRename && !args.newDsname) throw new Error('Give newDsname (data set rename) or member + newMember (member rename).');
+      const from = { dsn: args.dsname, ...(memberRename ? { member: args.member } : {}) };
+      const body = { request: 'rename', 'from-dataset': from, ...(args.enq ? { enq: args.enq } : {}) };
+      const target = memberRename ? dsPath(args.dsname, args.newMember) : dsPath(args.newDsname);
+      return textResult(await zosmfFetch(target, jsonBody('PUT', body)));
+    }
+
+    case 'copyDataset': {
+      const from = { dsn: args.fromDsname };
+      if (args.fromMember) from.member = args.fromMember;
+      if (args.fromVolser) from.volser = args.fromVolser;
+      if (args.alias !== undefined) from.alias = args.alias;
+      const body = { request: 'copy', 'from-dataset': from };
+      if (args.replace !== undefined) body.replace = args.replace;
+      if (args.enq) body.enq = args.enq;
+      return textResult(await zosmfFetch(dsPath(args.toDsname, args.toMember), jsonBody('PUT', body)));
+    }
+
+    case 'hsmRequest': {
+      const body = { request: args.request };
+      if (args.wait !== undefined) body.wait = args.wait;
+      if (args.purge !== undefined) body.purge = args.purge;
+      return textResult(await zosmfFetch(dsPath(args.dsname), jsonBody('PUT', body)));
+    }
 
     case 'listMembers': {
       const params = new URLSearchParams();
@@ -723,30 +1169,32 @@ async function callTool(name, args) {
       setIf(params, 'start', args.start);
       const headers = {};
       if (args.maxItems !== undefined) headers['X-IBM-Max-Items'] = String(args.maxItems);
+      if (args.attributes) headers['X-IBM-Attributes'] = args.attributes;
       const qs = params.toString();
-      return textResult(await mvsmfFetch(`${dsPath(args.dsname)}/member${qs ? `?${qs}` : ''}`, { headers }));
+      return textResult(await zosmfFetch(`${dsPath(args.dsname, undefined, args.volser)}/member${qs ? `?${qs}` : ''}`, { headers }));
     }
 
     case 'readMember':
-      return readDatasetLike(dsPath(args.dsname, args.member), args.dsname, args);
+      return readDatasetLike(dsPath(args.dsname, args.member, args.volser), args.dsname, args);
 
     case 'writeMember':
-      return writeDatasetLike(dsPath(args.dsname, args.member), args.dsname, args);
+      return writeDatasetLike(dsPath(args.dsname, args.member, args.volser), args.dsname, args);
 
     case 'deleteMember':
-      return textResult(await mvsmfFetch(dsPath(args.dsname, args.member), { method: 'DELETE' }));
+      return textResult(await zosmfFetch(dsPath(args.dsname, args.member, args.volser), { method: 'DELETE' }));
 
     // --- USS ---
     case 'listUssFiles': {
       const params = new URLSearchParams({ path: args.path });
+      for (const k of ['name', 'depth', 'type', 'filesys', 'symlinks']) setIf(params, k, args[k]);
       const headers = {};
       if (args.maxItems !== undefined) headers['X-IBM-Max-Items'] = String(args.maxItems);
-      return textResult(await mvsmfFetch(`/zosmf/restfiles/fs?${params}`, { headers }));
+      return textResult(await zosmfFetch(`/zosmf/restfiles/fs?${params}`, { headers }));
     }
 
     case 'readUssFile':
       return textResult(
-        await mvsmfFetch(`/zosmf/restfiles/fs/${ussPath(args.path)}`, {
+        await zosmfFetch(`/zosmf/restfiles/fs/${ussPath(args.path)}`, {
           headers: readHeaders(args),
           binary: args.dataType === 'binary',
         })
@@ -756,7 +1204,7 @@ async function callTool(name, args) {
       if (args.encoding) throw new Error('encoding is only supported for data sets; USS files have no LRECL.');
       const { body, dataType } = await writeBody(args);
       return textResult(
-        await mvsmfFetch(`/zosmf/restfiles/fs/${ussPath(args.path)}`, {
+        await zosmfFetch(`/zosmf/restfiles/fs/${ussPath(args.path)}`, {
           method: 'PUT',
           headers: writeHeaders(args, dataType),
           body,
@@ -766,66 +1214,128 @@ async function callTool(name, args) {
 
     case 'createUssFile':
       return textResult(
-        await mvsmfFetch(`/zosmf/restfiles/fs/${ussPath(args.path)}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            type: args.isDirectory ? 'directory' : 'file',
-            ...(args.mode ? { mode: args.mode } : {}),
-          }),
-        })
+        await zosmfFetch(
+          `/zosmf/restfiles/fs/${ussPath(args.path)}`,
+          jsonBody('POST', { type: args.isDirectory ? 'directory' : 'file', ...(args.mode ? { mode: args.mode } : {}) })
+        )
       );
 
     case 'deleteUssFile':
       return textResult(
-        await mvsmfFetch(`/zosmf/restfiles/fs/${ussPath(args.path)}`, {
+        await zosmfFetch(`/zosmf/restfiles/fs/${ussPath(args.path)}`, {
           method: 'DELETE',
           headers: args.recursive ? { 'X-IBM-Option': 'recursive' } : {},
         })
       );
+
+    case 'chmodUssFile': {
+      const body = { request: 'chmod', mode: args.mode };
+      if (args.recursive !== undefined) body.recursive = args.recursive;
+      if (args.links) body.links = args.links;
+      return ussUtility(args.path, body);
+    }
+
+    case 'chownUssFile': {
+      const body = { request: 'chown', owner: args.owner };
+      if (args.group) body.group = args.group;
+      if (args.recursive !== undefined) body.recursive = args.recursive;
+      if (args.links) body.links = args.links;
+      return ussUtility(args.path, body);
+    }
+
+    case 'chtagUssFile': {
+      const body = { request: 'chtag', action: args.action };
+      if (args.type) body.type = args.type;
+      if (args.codeset) body.codeset = args.codeset;
+      if (args.recursive !== undefined) body.recursive = args.recursive;
+      if (args.links) body.links = args.links;
+      return ussUtility(args.path, body);
+    }
+
+    case 'moveUssFile': {
+      const body = { request: 'move', from: args.from };
+      if (args.overwrite !== undefined) body.overwrite = args.overwrite;
+      return ussUtility(args.to, body);
+    }
+
+    case 'copyUssFile': {
+      const body = { request: 'copy', from: args.from };
+      if (args.overwrite !== undefined) body.overwrite = args.overwrite;
+      if (args.recursive !== undefined) body.recursive = args.recursive;
+      return ussUtility(args.to, body);
+    }
 
     // --- Jobs ---
     case 'listJobs': {
       const params = new URLSearchParams();
       for (const k of ['owner', 'prefix', 'jobid', 'status']) setIf(params, k, args[k]);
       setIf(params, 'max-jobs', args.maxJobs);
+      setIf(params, 'user-correlator', args.userCorrelator);
       if (args.execData) params.set('exec-data', 'Y');
       const qs = params.toString();
-      return textResult(await mvsmfFetch(`/zosmf/restjobs/jobs${qs ? `?${qs}` : ''}`));
+      return textResult(await zosmfFetch(`/zosmf/restjobs/jobs${qs ? `?${qs}` : ''}`));
     }
 
-    case 'getJobStatus':
-      return textResult(await mvsmfFetch(`${jobPath(args.jobname, args.jobid)}${args.execData ? '?exec-data=Y' : ''}`));
+    case 'getJobStatus': {
+      const params = new URLSearchParams();
+      if (args.execData) params.set('exec-data', 'Y');
+      if (args.stepData) params.set('step-data', 'Y');
+      const qs = params.toString();
+      return textResult(await zosmfFetch(`${jobPath(args.jobname, args.jobid)}${qs ? `?${qs}` : ''}`));
+    }
 
     case 'listJobFiles':
-      return textResult(await mvsmfFetch(`${jobPath(args.jobname, args.jobid)}/files`));
+      return textResult(await zosmfFetch(`${jobPath(args.jobname, args.jobid)}/files`));
 
     case 'readJobFile':
-      return textResult(await mvsmfFetch(`${jobPath(args.jobname, args.jobid)}/files/${enc(args.ddid)}/records`));
+      return textResult(await zosmfFetch(`${jobPath(args.jobname, args.jobid)}/files/${enc(args.ddid)}/records`, { headers: readHeaders(args) }));
+
+    case 'getJobJcl':
+      return textResult(await zosmfFetch(`${jobPath(args.jobname, args.jobid)}/files/JCL/records`));
 
     case 'submitJob':
-      return textResult(
-        await mvsmfFetch('/zosmf/restjobs/jobs', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'text/plain' },
-          body: args.jcl,
-        })
-      );
+      return textResult(await zosmfFetch('/zosmf/restjobs/jobs', { method: 'PUT', headers: submitHeaders(args, 'text/plain'), body: args.jcl }));
 
     case 'submitJobFromDataset': {
-      // mvsMF's submit_file() accepts exactly the //'DSN(MEM)' form.
+      // Both servers accept exactly the //'DSN(MEM)' form.
       const bare = args.dsname.trim().replace(/^\/\//, '').replace(/^'|'$/g, '');
       return textResult(
-        await mvsmfFetch('/zosmf/restjobs/jobs', {
+        await zosmfFetch('/zosmf/restjobs/jobs', {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
+          headers: submitHeaders(args, 'application/json'),
           body: JSON.stringify({ file: `//'${bare}'` }),
         })
       );
     }
 
+    case 'submitJobFromUssFile':
+      return textResult(
+        await zosmfFetch('/zosmf/restjobs/jobs', {
+          method: 'PUT',
+          headers: submitHeaders(args, 'application/json'),
+          body: JSON.stringify({ file: args.path }),
+        })
+      );
+
     case 'purgeJob':
-      return textResult(await mvsmfFetch(jobPath(args.jobname, args.jobid), { method: 'DELETE' }));
+      return textResult(
+        await zosmfFetch(jobPath(args.jobname, args.jobid), {
+          method: 'DELETE',
+          headers: MVSMF ? {} : jobModifyHeaders(args),
+        })
+      );
+
+    case 'cancelJob':
+      return jobModify(args, { request: 'cancel' });
+
+    case 'holdJob':
+      return jobModify(args, { request: 'hold' });
+
+    case 'releaseJob':
+      return jobModify(args, { request: 'release' });
+
+    case 'changeJobClass':
+      return jobModify(args, { class: args.class });
 
     // --- Console services ---
     case 'issueConsoleCommand': {
@@ -836,26 +1346,33 @@ async function callTool(name, args) {
       if (args.unsolDetectSync) body['unsol-detect-sync'] = 'Y';
       if (args.unsolDetectTimeout !== undefined) body['unsol-detect-timeout'] = String(args.unsolDetectTimeout);
       if (args.detectTime !== undefined) body['detect-time'] = String(args.detectTime);
-      return textResult(
-        await mvsmfFetch(consolePath(args.consoleName), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        })
-      );
+      if (args.system) body.system = args.system;
+      return textResult(await zosmfFetch(consolePath(args.consoleName), jsonBody('PUT', body)));
     }
 
     case 'getConsoleMessages':
-      return textResult(await mvsmfFetch(`${consolePath(args.consoleName)}/solmsgs/${enc(args.key)}`));
+      return textResult(await zosmfFetch(`${consolePath(args.consoleName)}/solmsgs/${enc(args.key)}`));
 
     case 'getConsoleDetections':
-      return textResult(await mvsmfFetch(`${consolePath(args.consoleName)}/detections/${enc(args.key)}`));
+      return textResult(await zosmfFetch(`${consolePath(args.consoleName)}/detections/${enc(args.key)}`));
 
     case 'getHardcopyLog': {
       const params = new URLSearchParams();
       for (const k of ['timeRange', 'time', 'timestamp', 'direction', 'hardcopy', 'sysName']) setIf(params, k, args[k]);
       const qs = params.toString();
-      return textResult(await mvsmfFetch(`/zosmf/restconsoles/v1/log${qs ? `?${qs}` : ''}`));
+      return textResult(await zosmfFetch(`/zosmf/restconsoles/v1/log${qs ? `?${qs}` : ''}`));
+    }
+
+    // --- TSO ---
+    case 'issueTsoCommand': {
+      const params = new URLSearchParams();
+      setIf(params, 'acct', args.account);
+      setIf(params, 'proc', args.proc);
+      setIf(params, 'rsize', args.regionSize);
+      setIf(params, 'chset', args.characterSet);
+      setIf(params, 'cpage', args.codePage);
+      const qs = params.toString();
+      return textResult(await zosmfFetch(`/zosmf/tsoApp/v1/tso${qs ? `?${qs}` : ''}`, jsonBody('PUT', { tsoCmd: args.command, cmdState: 'stateless' })));
     }
 
     default:
@@ -868,7 +1385,7 @@ async function callTool(name, args) {
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: 'mvsmf-mcp-bridge', version: '1.1.0' },
+  { name: 'zosmf-mcp', version: '2.0.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -877,7 +1394,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   try {
-    return await callTool(name, args || {});
+    return await callTool(name, callArgs(name, args || {}));
   } catch (err) {
     return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
   }
@@ -885,4 +1402,4 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error(`mvsmf-mcp-bridge connected (base=${BASE_URL}, user=${USER || '(none)'})`);
+console.error(`zosmf-mcp connected (mode=${MODE}, base=${BASE_URL}, user=${USER || '(none)'}, tools=${TOOLS.length}/${ALL_TOOLS.length})`);
