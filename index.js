@@ -298,6 +298,9 @@ async function writeDatasetLike(path, dsname, args) {
 
 const ZOSMF_ONLY = Symbol('zosmfOnly');
 const zo = (prop) => ({ ...prop, [ZOSMF_ONLY]: true });
+// Enum values to remove in mvsmf mode; the rest of the property stays.
+const MVSMF_DROP = Symbol('mvsmfDropEnum');
+const zoEnum = (prop, values) => ({ ...prop, [MVSMF_DROP]: values });
 
 const DS_VOLSER = zo({ type: 'string', description: 'Volume serial for an uncataloged data set (the -(volser) route).' });
 
@@ -335,12 +338,15 @@ const DS_READ_OPTS = {
 const DS_WRITE_OPTS = {
   content: { type: 'string', description: 'Text content to write. Records are split at newlines.' },
   contentBase64: { type: 'string', description: 'Raw bytes (base64) to write in binary or record mode. Mutually exclusive with content.' },
-  dataType: {
-    type: 'string',
-    enum: ['text', 'binary', 'record'],
-    description:
-      'Transfer mode for the body. text (default): server ASCII->EBCDIC conversion. binary: bytes stored as-is, split at LRECL. record: contentBase64 carries a 4-byte big-endian length before each record (z/OSMF only; mvsMF accepts the header but stores garbage).',
-  },
+  dataType: zoEnum(
+    {
+      type: 'string',
+      enum: ['text', 'binary', 'record'],
+      description:
+        'Transfer mode for the body. text (default): server ASCII->EBCDIC conversion. binary: bytes stored as-is, split at LRECL. record: contentBase64 carries a 4-byte big-endian length before each record (z/OSMF only; mvsMF accepts the header but stores garbage).',
+    },
+    ['record']
+  ),
   fileEncoding: FILE_ENCODING,
   encoding: {
     type: 'string',
@@ -378,9 +384,6 @@ const JOB_MODIFY_OPTS = {
     description: 'X-IBM-Job-Modify-Version 2.0: wait for JES to complete the request and return its outcome (default true). false = 1.0, queue it and return 202.',
   },
 };
-
-// In mvsmf mode the dataType enums lose "record" on writes (accepted, not implemented).
-const MVSMF_ENUM_DROP = { dataType: ['record'] };
 
 const ALL_TOOLS = [
   {
@@ -1025,8 +1028,8 @@ function toolsForMode(mvsmf) {
     for (const [key, prop] of Object.entries(tool.inputSchema.properties)) {
       if (mvsmf && prop[ZOSMF_ONLY]) continue;
       const clean = { ...prop };
-      if (mvsmf && clean.enum && MVSMF_ENUM_DROP[key]) {
-        clean.enum = clean.enum.filter((v) => !MVSMF_ENUM_DROP[key].includes(v));
+      if (mvsmf && clean.enum && prop[MVSMF_DROP]) {
+        clean.enum = clean.enum.filter((v) => !prop[MVSMF_DROP].includes(v));
       }
       props[key] = clean;
     }
